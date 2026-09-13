@@ -1,37 +1,37 @@
 """
-TREND BREAKOUT BOT (OKX + MULTI-TIMEFRAME, TELEGRAM READY)
+SCALPING SİQNAL BOTU (OKX + MULTI-TIMEFRAME, TELEGRAM-ONLY)
 ===========================================================
-DƏYİŞİKLİKLƏR (bu versiyada, Bybit -> OKX keçidi):
-1. BYBIT ƏVƏZİNƏ OKX API: Bybit-in bəzi bölgələrdən (o cümlədən Render.com
-   datacenter-lərinin bir hissəsindən) blok olunması səbəbindən exchange
-   OKX-ə dəyişdirildi (blok problemi olmur).
-2. ÇOXLU TIMEFRAME - MÜSTƏQİL: 5dəq, 15dəq, 1saat, 4saat timeframe-lərinin
-   HƏR BİRİ tam MÜSTƏQİL izlənilir və öz Donchian+EMA+ADX+Volume siqnalını
-   verir. Yəni eyni simvolda eyni anda fərqli TF-lərdən fərqli (hətta əks)
-   siqnallar gələ bilər - bunlar ayrı-ayrı "trade" kimi izlənilir
-   (məsələn BTCUSDT|15m və BTCUSDT|4H eyni vaxtda aktiv ola bilər).
-3. Hər (simvol, timeframe) cütü üçün ayrıca EMA200 trend filtri öz TF-i
-   üzərində hesablanır (əvvəlki versiyada ayrı "trend TF" var idi, indi
-   hər TF öz-özünün trend filtridir).
-4. MTF (multi-timeframe cross-check) filtri götürüldü, çünki artıq hər TF
-   müstəqildir - əvəzinə hər TF öz ADX/Volume/ATR filtrini tətbiq edir.
-5. Telegram mesajlarında və /active əmrində timeframe də göstərilir.
+STRATEGİYA: EMA(9)/EMA(21) KROSOVER + RSI FİLTRİ + HƏCM TƏSDİQİ
+------------------------------------------------------------
+Bu bot əvvəlki "Trend Breakout" botundan tamam fərqlidir:
 
-DÜZƏLİŞ (bu versiyada, 1Hutc/4Hutc -> 1H/4H):
-OKX API-də 'utc' sonluqlu bar dəyərləri (6Hutc, 12Hutc, 1Dutc və s.) YALNIZ
-6 saat və daha böyük timeframe-lər üçün mövcuddur. 1H və 4H üçün belə bir
-UTC variantı ümumiyyətlə yoxdur (saat sərhədi Hong Kong vaxtı ilə UTC
-arasında dəyişmir, yalnız gün və daha böyük vahidlərdə fərq yaranır).
-Ona görə "1Hutc"/"4Hutc" OKX tərəfindən etibarsız parametr kimi rədd
-edilirdi və hər dəfə "5 ardıcıl dəfə məlumat alına bilmədi" xətası verirdi.
-Düzəliş: TIMEFRAMES = ["5m", "15m", "1H", "4H"]
+1. TIMEFRAME-LƏR QISADIR (scalping üçün): 1m, 3m, 5m — hər biri
+   MÜSTƏQİL izlənilir (əvvəlki bot kimi).
+2. SİQNAL MƏNTİQİ - EMA CROSSOVER:
+   - EMA(9) EMA(21)-i yuxarı keçəndə (bullish cross) -> LONG siqnalı
+   - EMA(9) EMA(21)-i aşağı keçəndə (bearish cross) -> SHORT siqnalı
+   Yalnız TƏZƏ bağlanmış şamda baş vermiş kross qəbul edilir (repaint yoxdur).
+3. RSI(14) FİLTRİ: Scalping-də ən pis şey artıq "yorulmuş" hərəkətə
+   girməkdir. Ona görə:
+   - LONG üçün RSI 40-75 aralığında olmalıdır (artıq həddindən aşırı
+     alınmış olmamalıdır)
+   - SHORT üçün RSI 25-60 aralığında olmalıdır
+4. HƏCM FİLTRİ: Kross anında həcm son 20 şamın ortalamasından
+   MIN_VOLUME_RATIO qədər yüksək olmalıdır (yalanı krosslardan qorunmaq üçün).
+5. ATR FİLTRİ: Bazar çox "ölü" olduqda (aşağı volatilite) scalping siqnalı
+   verilmir.
+6. RİSK İDARƏETMƏSİ: Sıx Chandelier-tipli trailing stop (ATR x 1.2) və
+   tez partial take-profit (0.8R-də), çünki scalping-də mənfəət pəncərəsi
+   kiçikdir və tez bağlamaq lazımdır.
 
-QALAN HİSSƏLƏR (thread-safety, PID lock, partial TP, trailing stop,
-cooldown, DB) əvvəlki versiya ilə eynidir.
+QALAN HİSSƏLƏR (thread-safety, PID lock, SQLite, Telegram komandaları,
+Flask endpoint-ləri) əvvəlki bot ilə eyni memarlıqdadır ki, tanış interfeys
+qalsın (/status, /stats, /active, /help).
+
+QEYD: Bu bot yalnız Telegram-a SİQNAL göndərir, real sifariş açmır/bağlamır.
 """
 
 import os
-import sys
 import time
 import atexit
 import sqlite3
@@ -59,75 +59,66 @@ OKX_BASE = "https://www.okx.com"
 OKX_KLINE_URL = f"{OKX_BASE}/api/v5/market/candles"
 OKX_TICKER_URL = f"{OKX_BASE}/api/v5/market/ticker"
 
-# İstəsəniz proxy (adətən OKX-ə ehtiyac qalmır, amma dəstək saxlanılıb)
 OKX_PROXY_URL = os.getenv("OKX_PROXY_URL", "").strip()
 OKX_PROXIES = {"http": OKX_PROXY_URL, "https": OKX_PROXY_URL} if OKX_PROXY_URL else None
 
-# OKX perpetual swap instId formatı: "BTC-USDT-SWAP"
 SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 
-# Hər TF müstəqil izlənilir. OKX 'bar' formatı: 5m, 15m, 1H, 4H
-# NOT: OKX-də 'utc' sonluqlu bar dəyərləri (məs. 6Hutc, 12Hutc, 1Dutc)
-# YALNIZ 6 saat və daha böyük timeframe-lər üçün mövcuddur. 1H/4H üçün
-# UTC variantı YOXDUR - ona görə sadə "1H" və "4H" istifadə olunur.
-TIMEFRAMES = ["5m", "15m", "1H", "4H"]
+# Scalping üçün QISA timeframe-lər. OKX bar formatı: 1m, 3m, 5m
+# (NOT: bunların 'utc' variantı yoxdur və lazım da deyil - saat sərhədi
+# problemi yalnız 6H+ üçündür).
+TIMEFRAMES = ["1m", "3m", "5m"]
 
-# Hər TF üçün nə qədər tez-tez şam yoxlanılsın (saniyə). Kiçik TF-lər daha
-# tez-tez, böyük TF-lər daha seyrək yoxlanıla bilər - burada sadəlik üçün
-# hamısı eyni əsas dövrədə yoxlanılır, amma "yeni bağlanmış şam" olmadıqda
-# heç bir hesablama aparılmır (artıq eyni şamdırsa skip edilir).
-CANDLE_POLL_SECONDS = 20
-PRICE_POLL_SECONDS = 10
+# Scalping-də tez reaksiya lazımdır - qısa poll interval-ları
+CANDLE_POLL_SECONDS = 8
+PRICE_POLL_SECONDS = 4
 MAX_CANDLES = 300
 
-DONCHIAN_PERIOD = 20
+EMA_FAST_PERIOD = 9
+EMA_SLOW_PERIOD = 21
+RSI_PERIOD = 14
 ATR_PERIOD = 14
-EMA_TREND_PERIOD = 200
-CHANDELIER_ATR_MULT = 3.0
+
+# LONG üçün qəbul edilən RSI aralığı (artıq "yorulmuş" bazara girməmək üçün)
+RSI_LONG_MIN = 40
+RSI_LONG_MAX = 75
+# SHORT üçün qəbul edilən RSI aralığı
+RSI_SHORT_MIN = 25
+RSI_SHORT_MAX = 60
+
+# Scalping-də stop daha sıxdır (trend botunda 3.0 idi)
+CHANDELIER_ATR_MULT = 1.2
 
 ACCOUNT_BALANCE_USDT = float(os.getenv("ACCOUNT_BALANCE_USDT", "1000"))
-RISK_PER_TRADE_PCT = 0.01
+RISK_PER_TRADE_PCT = 0.005  # scalping-də daha kiçik risk/trade
 
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "99999"))
-MAX_CONSECUTIVE_LOSSES = 3
-COOLDOWN_HOURS_AFTER_LOSSES = 24
+MAX_CONSECUTIVE_LOSSES = 4
+COOLDOWN_HOURS_AFTER_LOSSES = 6  # scalping-də daha qısa cooldown
 
 MAX_CONSECUTIVE_FETCH_FAILS = 5
-
-# ------------------------------------------------------------
-# SİQNAL PUANLAMASI (SCORING) - qrup eyni TF daxilində müqayisə edilir
-# ------------------------------------------------------------
-# BTC bu qrupa daxil deyil - həmişə müstəqil işləyir.
-# Eyni TF-də ETH və SOL eyni vaxtda breakout versə, yalnız ən yüksək
-# balı olan açılır (hər TF üçün ayrıca müqayisə edilir).
-SCORE_GROUP_SYMBOLS = ["ETH-USDT-SWAP", "SOL-USDT-SWAP"]
-MIN_SIGNAL_SCORE = float(os.getenv("MIN_SIGNAL_SCORE", "50"))
 
 # ------------------------------------------------------------
 # SİQNAL FİLTRLƏRİ
 # ------------------------------------------------------------
 ENABLE_VOLUME_FILTER = os.getenv("ENABLE_VOLUME_FILTER", "True").lower() == "true"
-MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.5"))
-
-ENABLE_ADX_FILTER = os.getenv("ENABLE_ADX_FILTER", "True").lower() == "true"
-MIN_ADX = float(os.getenv("MIN_ADX", "20"))
+MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.3"))
 
 ENABLE_ATR_FILTER = os.getenv("ENABLE_ATR_FILTER", "True").lower() == "true"
-MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.15"))
+MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.08"))
 
 ENABLE_SPREAD_FILTER = os.getenv("ENABLE_SPREAD_FILTER", "True").lower() == "true"
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.15"))
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.12"))
 
-# Eyni istiqamətdə (LONG/SHORT) maksimum aktiv trade sayı - BÜTÜN
-# simvol+TF cütləri arasında ümumi hesablanır
-MAX_SAME_DIRECTION_TRADES = int(os.getenv("MAX_SAME_DIRECTION_TRADES", "4"))
+MAX_SAME_DIRECTION_TRADES = int(os.getenv("MAX_SAME_DIRECTION_TRADES", "5"))
 
+# Scalping-də erkən qismən mənfəət götürmək vacibdir
 ENABLE_PARTIAL_TP = os.getenv("ENABLE_PARTIAL_TP", "True").lower() == "true"
-PARTIAL_TP_R_MULTIPLE = float(os.getenv("PARTIAL_TP_R_MULTIPLE", "1.0"))
-PARTIAL_TP_CLOSE_PCT = float(os.getenv("PARTIAL_TP_CLOSE_PCT", "0.5"))
+PARTIAL_TP_R_MULTIPLE = float(os.getenv("PARTIAL_TP_R_MULTIPLE", "0.8"))
+PARTIAL_TP_CLOSE_PCT = float(os.getenv("PARTIAL_TP_CLOSE_PCT", "0.6"))
 
-DB_FILE = "trend_breakout.db"
-PID_FILE = "trend_bot.lock"
+DB_FILE = "scalping_bot.db"
+PID_FILE = "scalping_bot.lock"
 
 
 # ============================================================
@@ -144,13 +135,8 @@ app = Flask(__name__)
 lock = threading.Lock()
 db_lock = threading.Lock()
 
-# candles[symbol][tf] = [...]
 candles = {s: {tf: [] for tf in TIMEFRAMES} for s in SYMBOLS}
-
-# active_trades key formatı: "SYMBOL|TF" -> trade dict
 active_trades = {}
-
-# last_signal_candle[symbol][tf] = candle_time
 last_signal_candle = {s: {tf: None for tf in TIMEFRAMES} for s in SYMBOLS}
 
 daily_trade_count = 0
@@ -159,7 +145,6 @@ daily_count_date = None
 consecutive_losses = 0
 cooldown_until = None
 
-# fetch_fail_counts[symbol][tf]
 fetch_fail_counts = {s: {tf: 0 for tf in TIMEFRAMES} for s in SYMBOLS}
 fetch_fail_alerted = {s: {tf: False for tf in TIMEFRAMES} for s in SYMBOLS}
 
@@ -173,7 +158,6 @@ def trade_key(symbol, tf):
 
 
 def display_symbol(symbol):
-    """'BTC-USDT-SWAP' -> 'BTC/USDT'"""
     parts = symbol.split("-")
     if len(parts) >= 2:
         return f"{parts[0]}/{parts[1]}"
@@ -194,13 +178,12 @@ def check_single_instance():
             if old_pid != os.getpid():
                 try:
                     os.kill(old_pid, 0)
-                    print(f"⚠️ [PID Lock] Bot artıq başqa prosesdə işləyir (PID: {old_pid}). Təkrarlanma dayandırıldı.")
+                    print(f"⚠️ [PID Lock] Bot artıq başqa prosesdə işləyir (PID: {old_pid}).")
                     return False
                 except (OSError, ProcessLookupError):
                     pass
         except (OSError, ValueError):
             pass
-
     try:
         with open(PID_FILE, "w") as f:
             f.write(pid)
@@ -228,7 +211,7 @@ atexit.register(release_pid_lock)
 
 
 # ============================================================
-# DATABASE (THREAD-SAFE)
+# DATABASE
 # ============================================================
 
 def init_db():
@@ -306,16 +289,13 @@ init_db()
 def send_telegram(message, chat_id=None, parse_mode=None):
     token = TELEGRAM_BOT_TOKEN
     target_chat_id = chat_id or TELEGRAM_CHAT_ID
-
     if not token or token == "YOUR_BOT_TOKEN_HERE" or not target_chat_id:
         print("❌ Telegram token və ya chat_id təyin edilməyib.")
         return False
-
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": target_chat_id, "text": message}
     if parse_mode:
         payload["parse_mode"] = parse_mode
-
     try:
         r = requests.post(url, json=payload, timeout=10)
         res = r.json()
@@ -335,11 +315,9 @@ def send_telegram(message, chat_id=None, parse_mode=None):
 def process_telegram_update(update_data):
     if not update_data or "message" not in update_data:
         return
-
     msg = update_data["message"]
     chat_id = msg.get("chat", {}).get("id")
     raw_text = msg.get("text", "").strip()
-
     if not chat_id or not raw_text:
         return
 
@@ -348,7 +326,7 @@ def process_telegram_update(update_data):
 
     if cmd in ["/start", "/help", "komek", "kömək", "yardim", "yardım"]:
         response_text = (
-            "🤖 *TREND BREAKOUT BOT ƏMRLƏRİ*\n\n"
+            "🤖 *SCALPING BOTU ƏMRLƏRİ*\n\n"
             "📊 /stats - Ümumi WIN/LOSS və Win Rate\n"
             "⚡ /active - Açıq olan pozisiyalar (timeframe ilə)\n"
             "🟢 /status - Botun vəziyyəti və günlük limitlər\n"
@@ -369,7 +347,7 @@ def process_telegram_update(update_data):
         limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
 
         response_text = (
-            "🤖 *BOT VƏZİYYƏTİ*\n\n"
+            "🤖 *BOT VƏZİYYƏTİ (SCALPING)*\n\n"
             "🟢 Status: ONLINE (OKX)\n"
             f"📡 TF-lər: {', '.join(TIMEFRAMES)}\n"
             f"📈 Açıq Trade Sayı: {active_count}\n"
@@ -390,7 +368,6 @@ def process_telegram_update(update_data):
     elif cmd in ["/active", "active", "aciq"]:
         with lock:
             trades_list = list(active_trades.values())
-
         if not trades_list:
             response_text = "ℹ️ Hal-hazırda aktiv trade yoxdur."
         else:
@@ -412,9 +389,7 @@ def telegram_polling_worker():
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         print("⚠️ TELEGRAM_BOT_TOKEN təyin edilmədiyi üçün Polling işə düşmədi.")
         return
-
     print("🤖 Telegram Long Polling başladıldı...")
-
     try:
         requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
     except Exception as e:
@@ -443,11 +418,6 @@ def telegram_polling_worker():
 # ============================================================
 
 def fetch_klines(symbol, bar, limit=MAX_CANDLES):
-    """
-    OKX /market/candles: cavab EN YENİ şam birinci olur - reverse edirik ki
-    xronoloji (köhnədən yeniyə) sıra olsun, əvvəlki Bybit versiyası ilə eyni
-    formatda.
-    """
     params = {"instId": symbol, "bar": bar, "limit": min(limit, 300)}
     try:
         r = requests.get(OKX_KLINE_URL, params=params, timeout=15, proxies=OKX_PROXIES)
@@ -457,9 +427,8 @@ def fetch_klines(symbol, bar, limit=MAX_CANDLES):
             _note_fetch_failure(symbol, bar)
             return []
         rows = data.get("data", [])
-        rows.reverse()  # köhnədən yeniyə
+        rows.reverse()
         _note_fetch_success(symbol, bar)
-        # OKX sıra: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
         return [{
             "time": int(row[0]),
             "open": float(row[1]),
@@ -545,17 +514,43 @@ def _note_fetch_success(symbol, tf):
 
 
 # ============================================================
-# İNDİKATORLAR (dəyişməyib)
+# İNDİKATORLAR
 # ============================================================
 
-def ema(values, period):
+def ema_series(values, period):
+    """Bütün seriya üçün EMA dəyərləri qaytarır (None-larla doldurulmuş baş hissə)."""
     if len(values) < period:
-        return None
+        return [None] * len(values)
     k = 2 / (period + 1)
-    result = sum(values[:period]) / period
+    result = [None] * (period - 1)
+    seed = sum(values[:period]) / period
+    result.append(seed)
+    prev = seed
     for v in values[period:]:
-        result = (v - result) * k + result
+        prev = (v - prev) * k + prev
+        result.append(prev)
     return result
+
+
+def rsi(values, period=RSI_PERIOD):
+    if len(values) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+    if len(gains) < period:
+        return None
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
 
 def atr(candles_list, period=ATR_PERIOD):
@@ -571,93 +566,8 @@ def atr(candles_list, period=ATR_PERIOD):
     return sum(trs[-period:]) / period
 
 
-def donchian_channel(candles_list, period, exclude_last=1):
-    window = candles_list[-(period + exclude_last):-exclude_last] if exclude_last else candles_list[-period:]
-    if len(window) < period:
-        return None, None
-    return max(c["high"] for c in window), min(c["low"] for c in window)
-
-
-def calc_adx(candles_list, period=14):
-    if len(candles_list) < period * 2 + 1:
-        return None
-
-    plus_dm, minus_dm, trs = [], [], []
-    for i in range(1, len(candles_list)):
-        up_move = candles_list[i]["high"] - candles_list[i - 1]["high"]
-        down_move = candles_list[i - 1]["low"] - candles_list[i]["low"]
-        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0)
-        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0)
-        h, l, pc = candles_list[i]["high"], candles_list[i]["low"], candles_list[i - 1]["close"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-
-    def wilder_smooth(values, period):
-        if len(values) < period:
-            return []
-        smoothed = [sum(values[:period])]
-        for v in values[period:]:
-            smoothed.append(smoothed[-1] - (smoothed[-1] / period) + v)
-        return smoothed
-
-    tr_smooth = wilder_smooth(trs, period)
-    plus_smooth = wilder_smooth(plus_dm, period)
-    minus_smooth = wilder_smooth(minus_dm, period)
-
-    if not tr_smooth or not plus_smooth or not minus_smooth:
-        return None
-
-    n = min(len(tr_smooth), len(plus_smooth), len(minus_smooth))
-    dx = []
-    for i in range(n):
-        t = tr_smooth[i]
-        if t == 0:
-            dx.append(0)
-            continue
-        p_di = 100 * (plus_smooth[i] / t)
-        m_di = 100 * (minus_smooth[i] / t)
-        denom = p_di + m_di
-        dx.append(100 * abs(p_di - m_di) / denom if denom else 0)
-
-    if len(dx) < period:
-        return None
-
-    adx_val = sum(dx[:period]) / period
-    for d in dx[period:]:
-        adx_val = (adx_val * (period - 1) + d) / period
-    return adx_val
-
-
-def calculate_signal_score(side, entry, donchian_high, donchian_low, current_atr,
-                            adx_value, breakout_volume, avg_volume):
-    adx_value = adx_value or 0
-    score_adx = min(adx_value / 40.0, 1.0) * 40
-
-    if current_atr and current_atr > 0:
-        if side == "LONG":
-            breakout_distance = max((entry - donchian_high) / current_atr, 0)
-        else:
-            breakout_distance = max((donchian_low - entry) / current_atr, 0)
-    else:
-        breakout_distance = 0
-    score_breakout = min(breakout_distance / 1.0, 1.0) * 30
-
-    if avg_volume and avg_volume > 0:
-        volume_ratio = breakout_volume / avg_volume
-    else:
-        volume_ratio = 1.0
-    score_volume = min(volume_ratio / 2.0, 1.0) * 30
-
-    total = round(score_adx + score_breakout + score_volume, 1)
-    breakdown = {
-        "adx": round(score_adx, 1),
-        "breakout": round(score_breakout, 1),
-        "volume": round(score_volume, 1),
-    }
-    return total, breakdown
-
-
 # ============================================================
-# RİSK İDARƏETMƏSİ (dəyişməyib)
+# RİSK İDARƏETMƏSİ
 # ============================================================
 
 def reset_daily_counter_if_needed():
@@ -708,48 +618,53 @@ def calc_position_size(entry, stop):
 
 
 # ============================================================
-# SİQNAL MƏNTİQİ - HƏR (SYMBOL, TF) MÜSTƏQİL
+# SİQNAL MƏNTİQİ - EMA CROSSOVER + RSI + HƏCM (SCALPING)
 # ============================================================
 
 def check_for_signal(symbol, tf):
     with lock:
         tf_data = list(candles[symbol][tf])
 
-    min_needed = max(DONCHIAN_PERIOD, EMA_TREND_PERIOD) + 10
+    min_needed = max(EMA_SLOW_PERIOD, RSI_PERIOD, ATR_PERIOD) + 30
     if len(tf_data) < min_needed:
         return None
 
-    closed_candle = tf_data[-2]  # bağlanmış şam (repaint yoxdur)
+    # Son bağlanmış şam tf_data[-2]-dir (tf_data[-1] hələ aktiv/açıq şam ola bilər)
+    closes = [c["close"] for c in tf_data[:-1]]
 
-    closes_excl_last = [c["close"] for c in tf_data[:-1]]
-    trend_ema = ema(closes_excl_last[-(EMA_TREND_PERIOD + 50):], EMA_TREND_PERIOD)
-    if trend_ema is None:
+    ema_fast = ema_series(closes, EMA_FAST_PERIOD)
+    ema_slow = ema_series(closes, EMA_SLOW_PERIOD)
+
+    if ema_fast[-1] is None or ema_slow[-1] is None or ema_fast[-2] is None or ema_slow[-2] is None:
         return None
 
-    bullish_regime = closed_candle["close"] > trend_ema
-    bearish_regime = closed_candle["close"] < trend_ema
+    prev_fast, prev_slow = ema_fast[-2], ema_slow[-2]
+    curr_fast, curr_slow = ema_fast[-1], ema_slow[-1]
 
-    donchian_high, donchian_low = donchian_channel(tf_data[:-1], DONCHIAN_PERIOD, exclude_last=1)
-    if donchian_high is None:
+    bullish_cross = prev_fast <= prev_slow and curr_fast > curr_slow
+    bearish_cross = prev_fast >= prev_slow and curr_fast < curr_slow
+
+    if not (bullish_cross or bearish_cross):
         return None
 
+    side = "LONG" if bullish_cross else "SHORT"
+
+    rsi_value = rsi(closes[-(RSI_PERIOD + 50):], RSI_PERIOD)
+    if rsi_value is None:
+        return None
+
+    if side == "LONG" and not (RSI_LONG_MIN <= rsi_value <= RSI_LONG_MAX):
+        print(f"⏸️ {symbol}[{tf}] LONG kross rədd edildi: RSI aralıq xaricində ({rsi_value:.1f})")
+        return None
+    if side == "SHORT" and not (RSI_SHORT_MIN <= rsi_value <= RSI_SHORT_MAX):
+        print(f"⏸️ {symbol}[{tf}] SHORT kross rədd edildi: RSI aralıq xaricində ({rsi_value:.1f})")
+        return None
+
+    closed_candle = tf_data[-2]
     current_atr = atr(tf_data[:-1], ATR_PERIOD)
     if current_atr is None or current_atr <= 0:
         return None
 
-    breakout_long = closed_candle["close"] > donchian_high
-    breakout_short = closed_candle["close"] < donchian_low
-
-    if not (breakout_long or breakout_short):
-        return None
-
-    side = "LONG" if breakout_long else "SHORT"
-    if side == "LONG" and not bullish_regime:
-        return None
-    if side == "SHORT" and not bearish_regime:
-        return None
-
-    adx_value = calc_adx(tf_data[:-1], ATR_PERIOD)
     volume_window = tf_data[:-2][-20:]
     avg_volume = (sum(c["volume"] for c in volume_window) / len(volume_window)) if volume_window else None
     breakout_volume = closed_candle["volume"]
@@ -757,24 +672,19 @@ def check_for_signal(symbol, tf):
     if ENABLE_VOLUME_FILTER and avg_volume:
         volume_ratio = breakout_volume / avg_volume if avg_volume else 0
         if volume_ratio < MIN_VOLUME_RATIO:
-            print(f"⏸️ {symbol}[{tf}] siqnalı rədd edildi: həcm zəif ({volume_ratio:.2f}x < {MIN_VOLUME_RATIO}x)")
-            return None
-
-    if ENABLE_ADX_FILTER and adx_value is not None:
-        if adx_value < MIN_ADX:
-            print(f"⏸️ {symbol}[{tf}] siqnalı rədd edildi: ADX zəif ({adx_value:.1f} < {MIN_ADX})")
+            print(f"⏸️ {symbol}[{tf}] kross rədd edildi: həcm zəif ({volume_ratio:.2f}x < {MIN_VOLUME_RATIO}x)")
             return None
 
     if ENABLE_ATR_FILTER:
         atr_pct = (current_atr / closed_candle["close"]) * 100
         if atr_pct < MIN_ATR_PCT:
-            print(f"⏸️ {symbol}[{tf}] siqnalı rədd edildi: ATR çox aşağıdır ({atr_pct:.3f}% < {MIN_ATR_PCT}%)")
+            print(f"⏸️ {symbol}[{tf}] kross rədd edildi: ATR çox aşağıdır ({atr_pct:.3f}% < {MIN_ATR_PCT}%)")
             return None
 
     if ENABLE_SPREAD_FILTER:
         spread_pct = fetch_spread_pct(symbol)
         if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
-            print(f"⏸️ {symbol}[{tf}] siqnalı rədd edildi: spread çox geniş ({spread_pct:.3f}% > {MAX_SPREAD_PCT}%)")
+            print(f"⏸️ {symbol}[{tf}] kross rədd edildi: spread çox geniş ({spread_pct:.3f}% > {MAX_SPREAD_PCT}%)")
             return None
 
     entry = closed_candle["close"]
@@ -787,14 +697,10 @@ def check_for_signal(symbol, tf):
         if initial_stop <= entry:
             return None
 
-    score, breakdown = calculate_signal_score(
-        side, entry, donchian_high, donchian_low, current_atr,
-        adx_value, breakout_volume, avg_volume
-    )
     return {
         "symbol": symbol, "tf": tf, "side": side, "entry": entry,
         "initial_stop": initial_stop, "candle_time": closed_candle["time"],
-        "atr": current_atr, "score": score, "score_breakdown": breakdown,
+        "atr": current_atr, "rsi": round(rsi_value, 1),
     }
 
 
@@ -853,28 +759,19 @@ def open_trade(signal):
     emoji = "🟢" if trade["side"] == "LONG" else "🔴"
     limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
 
-    score = signal.get("score")
-    breakdown = signal.get("score_breakdown") or {}
-    score_line = ""
-    if score is not None:
-        score_line = (
-            f"\n🎯 Siqnal Balı: {score}/100 "
-            f"(ADX:{breakdown.get('adx','-')} | Breakout:{breakdown.get('breakout','-')} | "
-            f"Həcm:{breakdown.get('volume','-')})\n"
-        )
-
     message = f"""
-🚨 TREND BREAKOUT SİQNALI (TEST REJİMİ) — OKX
+⚡ SCALPING SİQNALI (TEST REJİMİ) — OKX
 
 {emoji} {display_symbol(symbol)} {trade["side"]}  [{tf}]
 
 Entry: {trade["entry"]:.4f}
 İlkin Stop: {trade["initial_stop"]:.4f}
+RSI: {signal.get("rsi", "-")}
 Tövsiyə olunan pozisiya: ~{trade["position_size_usdt"]:.2f} USDT
-{score_line}
-Səbəb: Donchian({DONCHIAN_PERIOD}) breakout + EMA{EMA_TREND_PERIOD} trend ({tf} timeframe-də)
 
-⏳ Status: ACTIVE — Trailing Stop Aktivdir
+Səbəb: EMA{EMA_FAST_PERIOD}/EMA{EMA_SLOW_PERIOD} krosover + RSI filtri + həcm təsdiqi ({tf} timeframe-də)
+
+⏳ Status: ACTIVE — Sıx Trailing Stop Aktivdir
 📅 Günlük Trade Sayı: {current_daily_count}/{limit_str}
 """
     print(message)
@@ -930,7 +827,6 @@ def update_trailing_stops(key, price):
             trade["status"] = result
             trade["exit_price"] = price
             trade["closed_at"] = time.time()
-
             active_trades.pop(key, None)
             should_alert_cooldown = register_trade_result(result)
             trade_snapshot = dict(trade)
@@ -940,7 +836,7 @@ def update_trailing_stops(key, price):
         send_telegram(
             f"💰 PARTIAL TAKE-PROFIT — {display_symbol(partial_tp_hit['symbol'])} "
             f"{partial_tp_hit['side']} [{partial_tp_hit['tf']}]\n\n"
-            f"1R hədəfinə çatıldı, pozisiyanın ~{pct}%-i bağlandı (konseptual).\n"
+            f"{PARTIAL_TP_R_MULTIPLE}R hədəfinə çatıldı, pozisiyanın ~{pct}%-i bağlandı (konseptual).\n"
             f"Entry: {partial_tp_hit['entry']:.4f}\n"
             f"Partial Exit: {price:.4f}\n"
             f"Qalan {100-pct}% trailing stop ilə davam edir."
@@ -982,45 +878,10 @@ RESULT: {trade_snapshot["status"]}
 # ============================================================
 
 def process_pending_signals(pending_signals):
-    """
-    pending_signals: { (symbol, tf): signal_dict }
-    Hər TF öz-özlüyündə qruplaşdırılır (ETH/SOL eyni TF-də eyni anda
-    breakout versə, yalnız ən yüksək balı olan açılır). BTC həmişə
-    müstəqil açılır, TF-dən asılı olmayaraq.
-    """
-    if not pending_signals:
-        return
-
-    # BTC (qrupa daxil olmayanlar) - filtrsiz açılır
+    """Scalping botunda score-qruplaşdırma yoxdur - hər (symbol, tf)
+    siqnalı bir-birindən müstəqil açılır."""
     for (symbol, tf), signal in pending_signals.items():
-        if symbol not in SCORE_GROUP_SYMBOLS:
-            open_trade(signal)
-
-    # Eyni TF daxilində ETH/SOL qruplaşdırması
-    by_tf = {}
-    for (symbol, tf), signal in pending_signals.items():
-        if symbol in SCORE_GROUP_SYMBOLS:
-            by_tf.setdefault(tf, {})[symbol] = signal
-
-    for tf, group_signals in by_tf.items():
-        if not group_signals:
-            continue
-        best_symbol, best_signal = max(group_signals.items(), key=lambda kv: kv[1].get("score", 0))
-
-        for symbol, signal in group_signals.items():
-            score = signal.get("score", 0)
-            if symbol == best_symbol:
-                if score >= MIN_SIGNAL_SCORE:
-                    open_trade(signal)
-                else:
-                    print(f"⏸️ {symbol}[{tf}] ən yüksək bal idi ({score}/100) amma minimum həddi keçmədi.")
-            else:
-                print(f"⏭️ {symbol}[{tf}] siqnalı ötürüldü — {best_symbol} daha yüksək bal aldı.")
-                send_telegram(
-                    f"⏭️ {display_symbol(symbol)}[{tf}] breakout siqnalı var idi (bal: {score}/100), "
-                    f"lakin {display_symbol(best_symbol)} daha yüksək bal aldığı üçün "
-                    f"(bal: {best_signal.get('score', 0)}/100) yalnız o açıldı."
-                )
+        open_trade(signal)
 
 
 def candle_worker():
@@ -1044,7 +905,7 @@ def candle_worker():
                         if signal:
                             pending_signals[(symbol, tf)] = signal
 
-                time.sleep(0.3)  # OKX rate-limit üçün kiçik fasilə
+                time.sleep(0.25)  # OKX rate-limit üçün kiçik fasilə
 
         process_pending_signals(pending_signals)
 
@@ -1056,7 +917,6 @@ def price_worker():
         with lock:
             keys_to_check = list(active_trades.keys())
 
-        # Eyni simvol üçün bir dəfə qiymət çəkib bütün TF trade-lərinə tətbiq edirik
         symbols_needed = {k.split("|")[0] for k in keys_to_check}
         price_cache = {}
         for symbol in symbols_needed:
@@ -1084,7 +944,7 @@ def startup():
             return
         _startup_done = True
 
-    print("🚀 TREND BREAKOUT BOT (OKX, Multi-TF) BAŞLAYIR...")
+    print("🚀 SCALPING BOTU (OKX, Multi-TF) BAŞLAYIR...")
 
     threading.Thread(target=candle_worker, daemon=True).start()
     threading.Thread(target=price_worker, daemon=True).start()
@@ -1095,10 +955,10 @@ def startup():
     if SEND_STARTUP_MESSAGE:
         limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
         send_telegram(
-            "🚀 TREND BREAKOUT BOT AKTİVDİR! (OKX)\n\n"
+            "⚡ SCALPING BOTU AKTİVDİR! (OKX)\n\n"
             f"📡 {', '.join(display_symbol(s) for s in SYMBOLS)} izlənilir.\n"
             f"⏱️ Timeframe-lər (hər biri MÜSTƏQİL): {', '.join(TIMEFRAMES)}\n"
-            f"📊 Donchian({DONCHIAN_PERIOD}) + EMA{EMA_TREND_PERIOD} + Chandelier Exit\n"
+            f"📊 EMA{EMA_FAST_PERIOD}/EMA{EMA_SLOW_PERIOD} Krosover + RSI + Həcm Filtri\n"
             f"⚖️ Günlük Max Trade: {limit_str}\n"
             "💾 Nəticələr SQLite-də saxlanılır.\n\n"
             "💬 Bot əmrləri üçün Telegram-da /help yazın."
@@ -1118,6 +978,7 @@ def home():
     return jsonify({
         "status": "online",
         "exchange": "OKX",
+        "strategy": "EMA crossover + RSI + Volume (scalping)",
         "mode": "SIGNAL-ONLY (real sifariş yoxdur)",
         "symbols": SYMBOLS,
         "timeframes": TIMEFRAMES,
