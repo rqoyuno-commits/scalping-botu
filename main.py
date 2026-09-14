@@ -1,34 +1,12 @@
 """
-SCALPING SİQNAL BOTU (OKX + MULTI-TIMEFRAME, TELEGRAM-ONLY)
-===========================================================
-STRATEGİYA: EMA(9)/EMA(21) KROSOVER + RSI FİLTRİ + HƏCM TƏSDİQİ
-------------------------------------------------------------
-Bu bot əvvəlki "Trend Breakout" botundan tamam fərqlidir:
-
-1. TIMEFRAME-LƏR QISADIR (scalping üçün): 1m, 3m, 5m — hər biri
-   MÜSTƏQİL izlənilir (əvvəlki bot kimi).
-2. SİQNAL MƏNTİQİ - EMA CROSSOVER:
-   - EMA(9) EMA(21)-i yuxarı keçəndə (bullish cross) -> LONG siqnalı
-   - EMA(9) EMA(21)-i aşağı keçəndə (bearish cross) -> SHORT siqnalı
-   Yalnız TƏZƏ bağlanmış şamda baş vermiş kross qəbul edilir (repaint yoxdur).
-3. RSI(14) FİLTRİ: Scalping-də ən pis şey artıq "yorulmuş" hərəkətə
-   girməkdir. Ona görə:
-   - LONG üçün RSI 40-75 aralığında olmalıdır (artıq həddindən aşırı
-     alınmış olmamalıdır)
-   - SHORT üçün RSI 25-60 aralığında olmalıdır
-4. HƏCM FİLTRİ: Kross anında həcm son 20 şamın ortalamasından
-   MIN_VOLUME_RATIO qədər yüksək olmalıdır (yalanı krosslardan qorunmaq üçün).
-5. ATR FİLTRİ: Bazar çox "ölü" olduqda (aşağı volatilite) scalping siqnalı
-   verilmir.
-6. RİSK İDARƏETMƏSİ: Sıx Chandelier-tipli trailing stop (ATR x 1.2) və
-   tez partial take-profit (0.8R-də), çünki scalping-də mənfəət pəncərəsi
-   kiçikdir və tez bağlamaq lazımdır.
-
-QALAN HİSSƏLƏR (thread-safety, PID lock, SQLite, Telegram komandaları,
-Flask endpoint-ləri) əvvəlki bot ilə eyni memarlıqdadır ki, tanış interfeys
-qalsın (/status, /stats, /active, /help).
-
-QEYD: Bu bot yalnız Telegram-a SİQNAL göndərir, real sifariş açmır/bağlamır.
+SCALPING SİQNAL BOTU (OKX + MULTI-TIMEFRAME, OPTİMALLAŞDIRILMIŞ KORREKTƏ OLUNMUŞ VERSİYA)
+========================================================================================
+DÜZƏLİŞLƏR:
+1. SQLite Persistence: Aktiv tradelər bazada 'ACTIVE' kimi saxlanılır və restart-da bərpa olunur.
+2. Partial TP Breakeven: Partial TP vurulduqda Trailing Stop dərhal Entry qiymətinə çəkilir.
+3. Polling Sürətləndirildi: Price Check = 1s, Candle Check = 4s.
+4. Resurs Optimallaşdırılması: Klines limit=80 edinildi (OKX API rate limit qorunması).
+5. Toplu Ticker Sorğusu: Bütün qiymətlər tək API sorğusu ilə çəkilir.
 """
 
 import os
@@ -52,55 +30,39 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 USE_POLLING = os.getenv("USE_POLLING", "True").lower() == "true"
 SEND_STARTUP_MESSAGE = os.getenv("SEND_STARTUP_MESSAGE", "True").lower() == "true"
 
-# ------------------------------------------------------------
-# OKX ENDPOINTS
-# ------------------------------------------------------------
 OKX_BASE = "https://www.okx.com"
 OKX_KLINE_URL = f"{OKX_BASE}/api/v5/market/candles"
-OKX_TICKER_URL = f"{OKX_BASE}/api/v5/market/ticker"
+OKX_TICKERS_URL = f"{OKX_BASE}/api/v5/market/tickers"
 
 OKX_PROXY_URL = os.getenv("OKX_PROXY_URL", "").strip()
 OKX_PROXIES = {"http": OKX_PROXY_URL, "https": OKX_PROXY_URL} if OKX_PROXY_URL else None
 
 SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
-
-# Scalping üçün QISA timeframe-lər. OKX bar formatı: 1m, 3m, 5m
-# (NOT: bunların 'utc' variantı yoxdur və lazım da deyil - saat sərhədi
-# problemi yalnız 6H+ üçündür).
 TIMEFRAMES = ["1m", "3m", "5m"]
 
-# Scalping-də tez reaksiya lazımdır - qısa poll interval-ları
-CANDLE_POLL_SECONDS = 8
-PRICE_POLL_SECONDS = 4
-MAX_CANDLES = 300
+# Scalping üçün sürətli poll vaxtları
+CANDLE_POLL_SECONDS = 4
+PRICE_POLL_SECONDS = 1
+MAX_CANDLES = 80  # Indikatorlar üçün 80 şam tam kifayətdir
 
 EMA_FAST_PERIOD = 9
 EMA_SLOW_PERIOD = 21
 RSI_PERIOD = 14
 ATR_PERIOD = 14
 
-# LONG üçün qəbul edilən RSI aralığı (artıq "yorulmuş" bazara girməmək üçün)
 RSI_LONG_MIN = 40
 RSI_LONG_MAX = 75
-# SHORT üçün qəbul edilən RSI aralığı
 RSI_SHORT_MIN = 25
 RSI_SHORT_MAX = 60
 
-# Scalping-də stop daha sıxdır (trend botunda 3.0 idi)
 CHANDELIER_ATR_MULT = 1.2
 
 ACCOUNT_BALANCE_USDT = float(os.getenv("ACCOUNT_BALANCE_USDT", "1000"))
-RISK_PER_TRADE_PCT = 0.005  # scalping-də daha kiçik risk/trade
-
+RISK_PER_TRADE_PCT = 0.005
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "99999"))
-MAX_CONSECUTIVE_LOSSES = 4
-COOLDOWN_HOURS_AFTER_LOSSES = 6  # scalping-də daha qısa cooldown
 
 MAX_CONSECUTIVE_FETCH_FAILS = 5
 
-# ------------------------------------------------------------
-# SİQNAL FİLTRLƏRİ
-# ------------------------------------------------------------
 ENABLE_VOLUME_FILTER = os.getenv("ENABLE_VOLUME_FILTER", "True").lower() == "true"
 MIN_VOLUME_RATIO = float(os.getenv("MIN_VOLUME_RATIO", "1.3"))
 
@@ -112,7 +74,6 @@ MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.12"))
 
 MAX_SAME_DIRECTION_TRADES = int(os.getenv("MAX_SAME_DIRECTION_TRADES", "5"))
 
-# Scalping-də erkən qismən mənfəət götürmək vacibdir
 ENABLE_PARTIAL_TP = os.getenv("ENABLE_PARTIAL_TP", "True").lower() == "true"
 PARTIAL_TP_R_MULTIPLE = float(os.getenv("PARTIAL_TP_R_MULTIPLE", "0.8"))
 PARTIAL_TP_CLOSE_PCT = float(os.getenv("PARTIAL_TP_CLOSE_PCT", "0.6"))
@@ -122,15 +83,10 @@ PID_FILE = "scalping_bot.lock"
 
 
 # ============================================================
-# FLASK
+# FLASK & STATE
 # ============================================================
 
 app = Flask(__name__)
-
-
-# ============================================================
-# GLOBAL STATE & LOCKS
-# ============================================================
 
 lock = threading.Lock()
 db_lock = threading.Lock()
@@ -141,9 +97,6 @@ last_signal_candle = {s: {tf: None for tf in TIMEFRAMES} for s in SYMBOLS}
 
 daily_trade_count = 0
 daily_count_date = None
-
-consecutive_losses = 0
-cooldown_until = None
 
 fetch_fail_counts = {s: {tf: 0 for tf in TIMEFRAMES} for s in SYMBOLS}
 fetch_fail_alerted = {s: {tf: False for tf in TIMEFRAMES} for s in SYMBOLS}
@@ -159,13 +112,11 @@ def trade_key(symbol, tf):
 
 def display_symbol(symbol):
     parts = symbol.split("-")
-    if len(parts) >= 2:
-        return f"{parts[0]}/{parts[1]}"
-    return symbol
+    return f"{parts[0]}/{parts[1]}" if len(parts) >= 2 else symbol
 
 
 # ============================================================
-# SINGLE INSTANCE GUARD (PID LOCK)
+# SINGLE INSTANCE GUARD
 # ============================================================
 
 def check_single_instance():
@@ -200,9 +151,8 @@ def release_pid_lock():
     try:
         if os.path.exists(PID_FILE):
             with open(PID_FILE, "r") as f:
-                saved_pid = f.read().strip()
-            if saved_pid == str(os.getpid()):
-                os.remove(PID_FILE)
+                if f.read().strip() == str(os.getpid()):
+                    os.remove(PID_FILE)
     except Exception as e:
         print("⚠️ PID lock təmizləmə xətası:", e)
 
@@ -211,7 +161,7 @@ atexit.register(release_pid_lock)
 
 
 # ============================================================
-# DATABASE
+# DATABASE persistence (AKTİV TRADELƏRİN Saxlanması)
 # ============================================================
 
 def init_db():
@@ -220,15 +170,20 @@ def init_db():
         cur = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_key TEXT PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 timeframe TEXT NOT NULL,
                 side TEXT NOT NULL,
                 entry REAL NOT NULL,
                 initial_stop REAL NOT NULL,
-                exit_price REAL,
+                trailing_stop REAL NOT NULL,
+                extreme_price REAL NOT NULL,
+                atr REAL NOT NULL,
+                r_value REAL NOT NULL,
+                position_size_usdt REAL NOT NULL,
+                partial_taken INTEGER DEFAULT 0,
                 status TEXT NOT NULL,
-                position_size_usdt REAL,
+                exit_price REAL,
                 created_at REAL NOT NULL,
                 closed_at REAL
             )
@@ -237,26 +192,96 @@ def init_db():
         conn.close()
 
 
-def save_trade(trade):
+def db_save_new_trade(trade):
     try:
         with db_lock:
             conn = sqlite3.connect(DB_FILE, timeout=15)
             cur = conn.cursor()
             cur.execute("""
-                INSERT INTO trades
-                (symbol, timeframe, side, entry, initial_stop, exit_price, status,
-                 position_size_usdt, created_at, closed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO trades (
+                    trade_key, symbol, timeframe, side, entry, initial_stop,
+                    trailing_stop, extreme_price, atr, r_value, position_size_usdt,
+                    partial_taken, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                trade["symbol"], trade.get("tf", ""), trade["side"], trade["entry"],
-                trade["initial_stop"], trade.get("exit_price"),
-                trade["status"], trade.get("position_size_usdt"),
-                trade["created_at"], trade.get("closed_at"),
+                trade_key(trade["symbol"], trade["tf"]), trade["symbol"], trade["tf"],
+                trade["side"], trade["entry"], trade["initial_stop"], trade["trailing_stop"],
+                trade["extreme_price"], trade["atr"], trade["r_value"],
+                trade["position_size_usdt"], 1 if trade["partial_taken"] else 0,
+                "ACTIVE", trade["created_at"]
             ))
             conn.commit()
             conn.close()
     except Exception as e:
-        print("❌ save_trade xətası:", e)
+        print("❌ db_save_new_trade xətası:", e)
+
+
+def db_update_active_trade(trade):
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, timeout=15)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE trades SET 
+                    trailing_stop = ?, extreme_price = ?, partial_taken = ?
+                WHERE trade_key = ? AND status = 'ACTIVE'
+            """, (
+                trade["trailing_stop"], trade["extreme_price"],
+                1 if trade["partial_taken"] else 0,
+                trade_key(trade["symbol"], trade["tf"])
+            ))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print("❌ db_update_active_trade xətası:", e)
+
+
+def db_close_trade(trade):
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, timeout=15)
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE trades SET 
+                    status = ?, exit_price = ?, closed_at = ?, trailing_stop = ?
+                WHERE trade_key = ?
+            """, (
+                trade["status"], trade["exit_price"], trade["closed_at"],
+                trade["trailing_stop"], trade_key(trade["symbol"], trade["tf"])
+            ))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print("❌ db_close_trade xətası:", e)
+
+
+def db_load_active_trades():
+    loaded = {}
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, timeout=15)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT symbol, timeframe, side, entry, initial_stop, trailing_stop,
+                       extreme_price, atr, r_value, position_size_usdt, partial_taken, created_at
+                FROM trades WHERE status = 'ACTIVE'
+            """)
+            rows = cur.fetchall()
+            conn.close()
+
+        for r in rows:
+            symbol, tf, side, entry, init_stop, trail_stop, ext_price, atr_val, r_val, pos_size, partial, created = r
+            key = trade_key(symbol, tf)
+            loaded[key] = {
+                "symbol": symbol, "tf": tf, "side": side, "entry": entry,
+                "initial_stop": init_stop, "trailing_stop": trail_stop,
+                "extreme_price": ext_price, "atr": atr_val, "r_value": r_val,
+                "position_size_usdt": pos_size, "partial_taken": bool(partial),
+                "status": "ACTIVE", "created_at": created
+            }
+    except Exception as e:
+        print("❌ db_load_active_trades xətası:", e)
+    return loaded
 
 
 def get_statistics():
@@ -268,7 +293,7 @@ def get_statistics():
                 SELECT COUNT(*),
                        COALESCE(SUM(CASE WHEN status='WIN' THEN 1 ELSE 0 END), 0),
                        COALESCE(SUM(CASE WHEN status='LOSS' THEN 1 ELSE 0 END), 0)
-                FROM trades
+                FROM trades WHERE status IN ('WIN', 'LOSS')
             """)
             total, wins, losses = cur.fetchone()
             conn.close()
@@ -290,7 +315,6 @@ def send_telegram(message, chat_id=None, parse_mode=None):
     token = TELEGRAM_BOT_TOKEN
     target_chat_id = chat_id or TELEGRAM_CHAT_ID
     if not token or token == "YOUR_BOT_TOKEN_HERE" or not target_chat_id:
-        print("❌ Telegram token və ya chat_id təyin edilməyib.")
         return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": target_chat_id, "text": message}
@@ -298,17 +322,9 @@ def send_telegram(message, chat_id=None, parse_mode=None):
         payload["parse_mode"] = parse_mode
     try:
         r = requests.post(url, json=payload, timeout=10)
-        res = r.json()
-        if not res.get("ok"):
-            if parse_mode:
-                payload.pop("parse_mode", None)
-                r = requests.post(url, json=payload, timeout=10)
-                return r.json().get("ok", False)
-            print("❌ Telegram xətası:", res)
-            return False
-        return True
+        return r.json().get("ok", False)
     except Exception as e:
-        print("❌ Telegram bağlantı xətası:", e)
+        print("❌ Telegram xətası:", e)
         return False
 
 
@@ -324,61 +340,42 @@ def process_telegram_update(update_data):
     cmd = raw_text.split("@")[0].strip().lower()
     response_text = ""
 
-    if cmd in ["/start", "/help", "komek", "kömək", "yardim", "yardım"]:
+    if cmd in ["/start", "/help"]:
         response_text = (
             "🤖 *SCALPING BOTU ƏMRLƏRİ*\n\n"
-            "📊 /stats - Ümumi WIN/LOSS və Win Rate\n"
-            "⚡ /active - Açıq olan pozisiyalar (timeframe ilə)\n"
-            "🟢 /status - Botun vəziyyəti və günlük limitlər\n"
-            "❓ /help - Bu menyu"
+            "📊 /stats - WIN/LOSS göstəriciləri\n"
+            "⚡ /active - Açıq olan pozisiyalar\n"
+            "🟢 /status - Botun ümumi vəziyyəti"
         )
-
     elif cmd in ["/status", "status"]:
         with lock:
             active_count = len(active_trades)
-            reset_daily_counter_if_needed()
             current_daily = daily_trade_count
-            current_cooldown = cooldown_until
-
-        cooldown_str = "Aktiv deyil"
-        if current_cooldown:
-            cooldown_str = current_cooldown.strftime("%d.%m.%Y %H:%M UTC")
-
-        limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
-
         response_text = (
-            "🤖 *BOT VƏZİYYƏTİ (SCALPING)*\n\n"
+            "🤖 *BOT VƏZİYYƏTİ*\n\n"
             "🟢 Status: ONLINE (OKX)\n"
-            f"📡 TF-lər: {', '.join(TIMEFRAMES)}\n"
-            f"📈 Açıq Trade Sayı: {active_count}\n"
-            f"📅 Bugünkü Trade Sayı: {current_daily}/{limit_str}\n"
-            f"❄️ Cooldown: {cooldown_str}"
+            f"📈 Açıq Trade: {active_count}\n"
+            f"📅 Bugünkü Trade: {current_daily}/{MAX_TRADES_PER_DAY if MAX_TRADES_PER_DAY < 9999 else 'Limitsiz'}"
         )
-
-    elif cmd in ["/stats", "stats", "statistika"]:
+    elif cmd in ["/stats", "stats"]:
         stats = get_statistics()
         response_text = (
-            "📊 *ÜMUMİ STATİSTİKA*\n\n"
-            f"Cəmi Trade: {stats['total']}\n"
-            f"✅ WIN: {stats['wins']}\n"
-            f"❌ LOSS: {stats['losses']}\n"
+            "📊 *STATİSTİKA*\n\n"
+            f"Cəmi: {stats['total']} | ✅ WIN: {stats['wins']} | ❌ LOSS: {stats['losses']}\n"
             f"🎯 Win Rate: %{stats['win_rate']}"
         )
-
-    elif cmd in ["/active", "active", "aciq"]:
+    elif cmd in ["/active", "active"]:
         with lock:
             trades_list = list(active_trades.values())
         if not trades_list:
-            response_text = "ℹ️ Hal-hazırda aktiv trade yoxdur."
+            response_text = "ℹ️ Aktiv trade yoxdur."
         else:
             response_text = "⚡ *AÇIQ TRADELƏR*\n\n"
             for t in trades_list:
                 emoji = "🟢" if t["side"] == "LONG" else "🔴"
                 response_text += (
                     f"{emoji} *{display_symbol(t['symbol'])} {t['side']} [{t['tf']}]*\n"
-                    f"Entry: `{t['entry']:.4f}`\n"
-                    f"Trailing Stop: `{t['trailing_stop']:.4f}`\n"
-                    f"Həcm: ~`{t['position_size_usdt']:.2f}` USDT\n\n"
+                    f"Entry: `{t['entry']:.4f}` | Stop: `{t['trailing_stop']:.4f}`\n\n"
                 )
 
     if response_text:
@@ -387,130 +384,65 @@ def process_telegram_update(update_data):
 
 def telegram_polling_worker():
     if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        print("⚠️ TELEGRAM_BOT_TOKEN təyin edilmədiyi üçün Polling işə düşmədi.")
         return
-    print("🤖 Telegram Long Polling başladıldı...")
-    try:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook", timeout=10)
-    except Exception as e:
-        print("⚠️ deleteWebhook xətası:", e)
-
     offset = 0
     while True:
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-            params = {"offset": offset, "timeout": 20}
-            resp = requests.get(url, params=params, timeout=25)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("ok"):
-                    for update in data.get("result", []):
-                        offset = update["update_id"] + 1
-                        process_telegram_update(update)
-        except Exception as e:
-            print("❌ Telegram Polling xətası:", e)
-            time.sleep(5)
+            resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                                params={"offset": offset, "timeout": 20}, timeout=25)
+            if resp.status_code == 200 and resp.json().get("ok"):
+                for update in resp.json().get("result", []):
+                    offset = update["update_id"] + 1
+                    process_telegram_update(update)
+        except Exception:
+            time.sleep(3)
         time.sleep(1)
 
 
 # ============================================================
-# OKX REST
+# OKX OPTIMIZED REST API
 # ============================================================
 
 def fetch_klines(symbol, bar, limit=MAX_CANDLES):
-    params = {"instId": symbol, "bar": bar, "limit": min(limit, 300)}
+    params = {"instId": symbol, "bar": bar, "limit": min(limit, 100)}
     try:
-        r = requests.get(OKX_KLINE_URL, params=params, timeout=15, proxies=OKX_PROXIES)
+        r = requests.get(OKX_KLINE_URL, params=params, timeout=8, proxies=OKX_PROXIES)
         data = r.json()
         if data.get("code") != "0":
-            print(f"❌ OKX kline xətası {symbol} {bar}:", data)
-            _note_fetch_failure(symbol, bar)
             return []
         rows = data.get("data", [])
         rows.reverse()
-        _note_fetch_success(symbol, bar)
         return [{
-            "time": int(row[0]),
-            "open": float(row[1]),
-            "high": float(row[2]),
-            "low": float(row[3]),
-            "close": float(row[4]),
-            "volume": float(row[5]),
+            "time": int(row[0]), "open": float(row[1]), "high": float(row[2]),
+            "low": float(row[3]), "close": float(row[4]), "volume": float(row[5])
         } for row in rows]
-    except Exception as e:
-        print(f"❌ {symbol} {bar} kline sorğu xətası:", e)
-        _note_fetch_failure(symbol, bar)
+    except Exception:
         return []
 
 
-def fetch_price(symbol):
-    params = {"instId": symbol}
+def fetch_all_swap_tickers():
+    """Bütün SWAP qiymətlərini TƏK API sorğusu ilə çəkir."""
+    params = {"instType": "SWAP"}
     try:
-        r = requests.get(OKX_TICKER_URL, params=params, timeout=10, proxies=OKX_PROXIES)
+        r = requests.get(OKX_TICKERS_URL, params=params, timeout=5, proxies=OKX_PROXIES)
         data = r.json()
-        if data.get("code") != "0":
-            _note_fetch_failure(symbol, "_price")
-            return None
-        lst = data.get("data", [])
-        if not lst:
-            _note_fetch_failure(symbol, "_price")
-            return None
-        _note_fetch_success(symbol, "_price")
-        return float(lst[0]["last"])
+        if data.get("code") == "0":
+            res = {}
+            for item in data.get("data", []):
+                inst = item.get("instId")
+                last = item.get("last")
+                bid = item.get("bidPx")
+                ask = item.get("askPx")
+                if inst and last:
+                    res[inst] = {
+                        "last": float(last),
+                        "bid": float(bid) if bid else float(last),
+                        "ask": float(ask) if ask else float(last)
+                    }
+            return res
     except Exception as e:
-        print(f"❌ {symbol} qiymət sorğu xətası:", e)
-        _note_fetch_failure(symbol, "_price")
-        return None
-
-
-def fetch_spread_pct(symbol):
-    params = {"instId": symbol}
-    try:
-        r = requests.get(OKX_TICKER_URL, params=params, timeout=10, proxies=OKX_PROXIES)
-        data = r.json()
-        if data.get("code") != "0":
-            return None
-        lst = data.get("data", [])
-        if not lst:
-            return None
-        bid = float(lst[0].get("bidPx", 0) or 0)
-        ask = float(lst[0].get("askPx", 0) or 0)
-        if bid <= 0 or ask <= 0:
-            return None
-        mid = (bid + ask) / 2
-        return ((ask - bid) / mid) * 100
-    except Exception as e:
-        print(f"⚠️ {symbol} spread sorğu xətası:", e)
-        return None
-
-
-def _note_fetch_failure(symbol, tf):
-    alert_needed = False
-    with lock:
-        d = fetch_fail_counts.setdefault(symbol, {})
-        a = fetch_fail_alerted.setdefault(symbol, {})
-        d[tf] = d.get(tf, 0) + 1
-        if d[tf] >= MAX_CONSECUTIVE_FETCH_FAILS and not a.get(tf, False):
-            a[tf] = True
-            alert_needed = True
-    if alert_needed:
-        send_telegram(
-            f"⚠️ {display_symbol(symbol)} [{tf}]: OKX-dən {MAX_CONSECUTIVE_FETCH_FAILS} ardıcıl dəfə "
-            f"məlumat alına bilmədi. Şəbəkə/API problemi ola bilər."
-        )
-
-
-def _note_fetch_success(symbol, tf):
-    was_alerted = False
-    with lock:
-        a = fetch_fail_alerted.setdefault(symbol, {})
-        d = fetch_fail_counts.setdefault(symbol, {})
-        if a.get(tf, False):
-            was_alerted = True
-        d[tf] = 0
-        a[tf] = False
-    if was_alerted:
-        send_telegram(f"✅ {display_symbol(symbol)} [{tf}]: OKX bağlantısı bərpa olundu, məlumat axını normaldır.")
+        print("❌ Tickers fetch error:", e)
+    return {}
 
 
 # ============================================================
@@ -518,7 +450,6 @@ def _note_fetch_success(symbol, tf):
 # ============================================================
 
 def ema_series(values, period):
-    """Bütün seriya üçün EMA dəyərləri qaytarır (None-larla doldurulmuş baş hissə)."""
     if len(values) < period:
         return [None] * len(values)
     k = 2 / (period + 1)
@@ -549,8 +480,7 @@ def rsi(values, period=RSI_PERIOD):
         avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     if avg_loss == 0:
         return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + (avg_gain / avg_loss)))
 
 
 def atr(candles_list, period=ATR_PERIOD):
@@ -561,141 +491,69 @@ def atr(candles_list, period=ATR_PERIOD):
         h, l = candles_list[i]["high"], candles_list[i]["low"]
         pc = candles_list[i - 1]["close"]
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    if len(trs) < period:
-        return None
-    return sum(trs[-period:]) / period
+    return sum(trs[-period:]) / period if len(trs) >= period else None
 
 
 # ============================================================
-# RİSK İDARƏETMƏSİ
+# SİQNAL & TRADE YARADILMASI
 # ============================================================
-
-def reset_daily_counter_if_needed():
-    global daily_trade_count, daily_count_date
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if daily_count_date != today:
-        daily_count_date = today
-        daily_trade_count = 0
-
-
-def risk_checks_pass():
-    reset_daily_counter_if_needed()
-    if cooldown_until is not None:
-        if datetime.now(timezone.utc) < cooldown_until:
-            return False, f"Cooldown aktivdir, {cooldown_until.isoformat()} tarixinə qədər"
-    if daily_trade_count >= MAX_TRADES_PER_DAY:
-        return False, "Günlük trade limiti dolub"
-    return True, ""
-
-
-def register_trade_opened():
-    global daily_trade_count
-    daily_trade_count += 1
-
-
-def register_trade_result(result):
-    global consecutive_losses, cooldown_until
-    should_alert_cooldown = False
-    if result == "LOSS":
-        consecutive_losses += 1
-        if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            cooldown_until_ts = datetime.now(timezone.utc).timestamp() + COOLDOWN_HOURS_AFTER_LOSSES * 3600
-            cooldown_until = datetime.fromtimestamp(cooldown_until_ts, tz=timezone.utc)
-            should_alert_cooldown = True
-    else:
-        consecutive_losses = 0
-    return should_alert_cooldown
-
 
 def calc_position_size(entry, stop):
     risk_amount = ACCOUNT_BALANCE_USDT * RISK_PER_TRADE_PCT
     stop_distance = abs(entry - stop)
     if stop_distance <= 0:
         return 0
-    qty = risk_amount / stop_distance
-    position_value_usdt = qty * entry
-    return round(position_value_usdt, 2)
+    return round((risk_amount / stop_distance) * entry, 2)
 
-
-# ============================================================
-# SİQNAL MƏNTİQİ - EMA CROSSOVER + RSI + HƏCM (SCALPING)
-# ============================================================
 
 def check_for_signal(symbol, tf):
     with lock:
         tf_data = list(candles[symbol][tf])
 
-    min_needed = max(EMA_SLOW_PERIOD, RSI_PERIOD, ATR_PERIOD) + 30
+    min_needed = max(EMA_SLOW_PERIOD, RSI_PERIOD, ATR_PERIOD) + 15
     if len(tf_data) < min_needed:
         return None
 
-    # Son bağlanmış şam tf_data[-2]-dir (tf_data[-1] hələ aktiv/açıq şam ola bilər)
     closes = [c["close"] for c in tf_data[:-1]]
-
     ema_fast = ema_series(closes, EMA_FAST_PERIOD)
     ema_slow = ema_series(closes, EMA_SLOW_PERIOD)
 
-    if ema_fast[-1] is None or ema_slow[-1] is None or ema_fast[-2] is None or ema_slow[-2] is None:
+    if None in (ema_fast[-1], ema_slow[-1], ema_fast[-2], ema_slow[-2]):
         return None
 
-    prev_fast, prev_slow = ema_fast[-2], ema_slow[-2]
-    curr_fast, curr_slow = ema_fast[-1], ema_slow[-1]
-
-    bullish_cross = prev_fast <= prev_slow and curr_fast > curr_slow
-    bearish_cross = prev_fast >= prev_slow and curr_fast < curr_slow
+    bullish_cross = ema_fast[-2] <= ema_slow[-2] and ema_fast[-1] > ema_slow[-1]
+    bearish_cross = ema_fast[-2] >= ema_slow[-2] and ema_fast[-1] < ema_slow[-1]
 
     if not (bullish_cross or bearish_cross):
         return None
 
     side = "LONG" if bullish_cross else "SHORT"
-
-    rsi_value = rsi(closes[-(RSI_PERIOD + 50):], RSI_PERIOD)
+    rsi_value = rsi(closes, RSI_PERIOD)
     if rsi_value is None:
         return None
 
     if side == "LONG" and not (RSI_LONG_MIN <= rsi_value <= RSI_LONG_MAX):
-        print(f"⏸️ {symbol}[{tf}] LONG kross rədd edildi: RSI aralıq xaricində ({rsi_value:.1f})")
         return None
     if side == "SHORT" and not (RSI_SHORT_MIN <= rsi_value <= RSI_SHORT_MAX):
-        print(f"⏸️ {symbol}[{tf}] SHORT kross rədd edildi: RSI aralıq xaricində ({rsi_value:.1f})")
         return None
 
     closed_candle = tf_data[-2]
     current_atr = atr(tf_data[:-1], ATR_PERIOD)
-    if current_atr is None or current_atr <= 0:
+    if not current_atr or current_atr <= 0:
         return None
 
-    volume_window = tf_data[:-2][-20:]
-    avg_volume = (sum(c["volume"] for c in volume_window) / len(volume_window)) if volume_window else None
-    breakout_volume = closed_candle["volume"]
-
-    if ENABLE_VOLUME_FILTER and avg_volume:
-        volume_ratio = breakout_volume / avg_volume if avg_volume else 0
-        if volume_ratio < MIN_VOLUME_RATIO:
-            print(f"⏸️ {symbol}[{tf}] kross rədd edildi: həcm zəif ({volume_ratio:.2f}x < {MIN_VOLUME_RATIO}x)")
+    if ENABLE_VOLUME_FILTER:
+        volume_window = tf_data[:-2][-20:]
+        avg_vol = (sum(c["volume"] for c in volume_window) / len(volume_window)) if volume_window else 0
+        if avg_vol > 0 and (closed_candle["volume"] / avg_vol) < MIN_VOLUME_RATIO:
             return None
 
     if ENABLE_ATR_FILTER:
-        atr_pct = (current_atr / closed_candle["close"]) * 100
-        if atr_pct < MIN_ATR_PCT:
-            print(f"⏸️ {symbol}[{tf}] kross rədd edildi: ATR çox aşağıdır ({atr_pct:.3f}% < {MIN_ATR_PCT}%)")
-            return None
-
-    if ENABLE_SPREAD_FILTER:
-        spread_pct = fetch_spread_pct(symbol)
-        if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
-            print(f"⏸️ {symbol}[{tf}] kross rədd edildi: spread çox geniş ({spread_pct:.3f}% > {MAX_SPREAD_PCT}%)")
+        if ((current_atr / closed_candle["close"]) * 100) < MIN_ATR_PCT:
             return None
 
     entry = closed_candle["close"]
-    if side == "LONG":
-        initial_stop = entry - current_atr * CHANDELIER_ATR_MULT
-        if initial_stop >= entry:
-            return None
-    else:
-        initial_stop = entry + current_atr * CHANDELIER_ATR_MULT
-        if initial_stop <= entry:
-            return None
+    initial_stop = entry - (current_atr * CHANDELIER_ATR_MULT) if side == "LONG" else entry + (current_atr * CHANDELIER_ATR_MULT)
 
     return {
         "symbol": symbol, "tf": tf, "side": side, "entry": entry,
@@ -705,104 +563,63 @@ def check_for_signal(symbol, tf):
 
 
 def open_trade(signal):
-    symbol = signal["symbol"]
-    tf = signal["tf"]
+    symbol, tf = signal["symbol"], signal["tf"]
     key = trade_key(symbol, tf)
-    trade = None
 
     with lock:
-        if key in active_trades:
-            return
-        if last_signal_candle[symbol][tf] == signal["candle_time"]:
-            return
-
-        ok, reason = risk_checks_pass()
-        if not ok:
-            print(f"⏸️ {symbol}[{tf}] siqnalı rədd edildi: {reason}")
-            return
-
-        same_direction_count = sum(
-            1 for t in active_trades.values() if t["side"] == signal["side"]
-        )
-        if same_direction_count >= MAX_SAME_DIRECTION_TRADES:
-            print(
-                f"⏸️ {symbol}[{tf}] siqnalı rədd edildi: {signal['side']} istiqamətində "
-                f"artıq {same_direction_count} aktiv trade var (limit: {MAX_SAME_DIRECTION_TRADES})"
-            )
+        if key in active_trades or last_signal_candle[symbol][tf] == signal["candle_time"]:
             return
 
         last_signal_candle[symbol][tf] = signal["candle_time"]
         position_size = calc_position_size(signal["entry"], signal["initial_stop"])
 
         trade = {
-            "symbol": symbol,
-            "tf": tf,
-            "side": signal["side"],
-            "entry": signal["entry"],
-            "initial_stop": signal["initial_stop"],
-            "trailing_stop": signal["initial_stop"],
-            "extreme_price": signal["entry"],
-            "atr": signal["atr"],
-            "status": "ACTIVE",
-            "position_size_usdt": position_size,
-            "created_at": time.time(),
-            "r_value": abs(signal["entry"] - signal["initial_stop"]),
-            "partial_taken": False,
+            "symbol": symbol, "tf": tf, "side": signal["side"],
+            "entry": signal["entry"], "initial_stop": signal["initial_stop"],
+            "trailing_stop": signal["initial_stop"], "extreme_price": signal["entry"],
+            "atr": signal["atr"], "status": "ACTIVE", "position_size_usdt": position_size,
+            "created_at": time.time(), "r_value": abs(signal["entry"] - signal["initial_stop"]),
+            "partial_taken": False
         }
-        active_trades[key] = trade
-        register_trade_opened()
-        current_daily_count = daily_trade_count
 
-    if trade is None:
-        return
+        active_trades[key] = trade
+        db_save_new_trade(trade)  # DƏRHAL SQLite BAZASINA YAZILIR
 
     emoji = "🟢" if trade["side"] == "LONG" else "🔴"
-    limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
-
-    message = f"""
-⚡ SCALPING SİQNALI (TEST REJİMİ) — OKX
-
-{emoji} {display_symbol(symbol)} {trade["side"]}  [{tf}]
-
-Entry: {trade["entry"]:.4f}
-İlkin Stop: {trade["initial_stop"]:.4f}
-RSI: {signal.get("rsi", "-")}
-Tövsiyə olunan pozisiya: ~{trade["position_size_usdt"]:.2f} USDT
-
-Səbəb: EMA{EMA_FAST_PERIOD}/EMA{EMA_SLOW_PERIOD} krosover + RSI filtri + həcm təsdiqi ({tf} timeframe-də)
-
-⏳ Status: ACTIVE — Sıx Trailing Stop Aktivdir
-📅 Günlük Trade Sayı: {current_daily_count}/{limit_str}
-"""
-    print(message)
-    send_telegram(message)
+    send_telegram(
+        f"⚡ SCALPING SİQNALI (OKX)\n\n"
+        f"{emoji} {display_symbol(symbol)} {trade['side']} [{tf}]\n"
+        f"Entry: {trade['entry']:.4f}\n"
+        f"Initial Stop: {trade['initial_stop']:.4f}\n"
+        f"RSI: {signal['rsi']} | Həcm: ~{trade['position_size_usdt']:.2f} USDT"
+    )
 
 
 def update_trailing_stops(key, price):
     trade_snapshot = None
-    should_alert_cooldown = False
-    partial_tp_hit = None
+    partial_tp_hit = False
 
     with lock:
         trade = active_trades.get(key)
         if not trade:
             return
 
-        if ENABLE_PARTIAL_TP and not trade.get("partial_taken", False) and trade.get("r_value", 0) > 0:
-            r_value = trade["r_value"]
-            if trade["side"] == "LONG":
-                target = trade["entry"] + r_value * PARTIAL_TP_R_MULTIPLE
-                hit = price >= target
-            else:
-                target = trade["entry"] - r_value * PARTIAL_TP_R_MULTIPLE
-                hit = price <= target
-            if hit:
+        # 1. PARTIAL TP & BREAKEVEN DÜZƏLİŞİ
+        if ENABLE_PARTIAL_TP and not trade["partial_taken"] and trade["r_value"] > 0:
+            r_val = trade["r_value"]
+            target_hit = (price >= trade["entry"] + r_val * PARTIAL_TP_R_MULTIPLE) if trade["side"] == "LONG" else (price <= trade["entry"] - r_val * PARTIAL_TP_R_MULTIPLE)
+            
+            if target_hit:
                 trade["partial_taken"] = True
-                trade["partial_exit_price"] = price
-                partial_tp_hit = dict(trade)
+                partial_tp_hit = True
+                # BREAKEVEN FIX: Trailing Stop-u ƏN AZI giriş qiymətinə çəkirik
+                if trade["side"] == "LONG":
+                    trade["trailing_stop"] = max(trade["trailing_stop"], trade["entry"])
+                else:
+                    trade["trailing_stop"] = min(trade["trailing_stop"], trade["entry"])
 
+        # 2. TRAILING STOP YENİLƏNMƏSİ
         result = None
-
         if trade["side"] == "LONG":
             if price > trade["extreme_price"]:
                 trade["extreme_price"] = price
@@ -810,7 +627,7 @@ def update_trailing_stops(key, price):
                 if new_stop > trade["trailing_stop"]:
                     trade["trailing_stop"] = new_stop
             if price <= trade["trailing_stop"]:
-                result = "WIN" if trade["trailing_stop"] > trade["entry"] else "LOSS"
+                result = "WIN" if trade["trailing_stop"] >= trade["entry"] else "LOSS"
         else:
             if price < trade["extreme_price"]:
                 trade["extreme_price"] = price
@@ -818,58 +635,32 @@ def update_trailing_stops(key, price):
                 if new_stop < trade["trailing_stop"]:
                     trade["trailing_stop"] = new_stop
             if price >= trade["trailing_stop"]:
-                result = "WIN" if trade["trailing_stop"] < trade["entry"] else "LOSS"
+                result = "WIN" if trade["trailing_stop"] <= trade["entry"] else "LOSS"
 
-        if result is None:
-            if partial_tp_hit is None:
-                return
-        else:
+        # Bazadakı aktiv trade məlumatını yeniləyirik
+        if partial_tp_hit or result is None:
+            db_update_active_trade(trade)
+
+        if result:
             trade["status"] = result
             trade["exit_price"] = price
             trade["closed_at"] = time.time()
             active_trades.pop(key, None)
-            should_alert_cooldown = register_trade_result(result)
             trade_snapshot = dict(trade)
+            db_close_trade(trade_snapshot)  # BAZADA BAĞLAYIRIQ
 
-    if partial_tp_hit is not None:
-        pct = int(PARTIAL_TP_CLOSE_PCT * 100)
+    if partial_tp_hit:
         send_telegram(
-            f"💰 PARTIAL TAKE-PROFIT — {display_symbol(partial_tp_hit['symbol'])} "
-            f"{partial_tp_hit['side']} [{partial_tp_hit['tf']}]\n\n"
-            f"{PARTIAL_TP_R_MULTIPLE}R hədəfinə çatıldı, pozisiyanın ~{pct}%-i bağlandı (konseptual).\n"
-            f"Entry: {partial_tp_hit['entry']:.4f}\n"
-            f"Partial Exit: {price:.4f}\n"
-            f"Qalan {100-pct}% trailing stop ilə davam edir."
+            f"💰 PARTIAL TP & BREAKEVEN — {display_symbol(trade['symbol'])} [{trade['tf']}]\n"
+            f"0.8R mənfəət götürüldü (60%). Stop loss Giriş Qiymətinə (`{trade['entry']:.4f}`) çəkildi!"
         )
 
-    if trade_snapshot is None:
-        return
-
-    save_trade(trade_snapshot)
-
-    emoji = "✅" if trade_snapshot["status"] == "WIN" else "❌"
-    message = f"""
-{emoji} TRADE BAĞLANDI — {trade_snapshot["status"]}
-
-{display_symbol(trade_snapshot["symbol"])} {trade_snapshot["side"]}  [{trade_snapshot["tf"]}]
-Entry: {trade_snapshot["entry"]:.4f}
-Exit (trailing stop): {trade_snapshot["exit_price"]:.4f}
-
-RESULT: {trade_snapshot["status"]}
-"""
-    send_telegram(message)
-
-    stats = get_statistics()
-    send_telegram(
-        f"📊 STATİSTİKA\nTotal: {stats['total']} | "
-        f"WIN: {stats['wins']} | LOSS: {stats['losses']} | "
-        f"Win Rate: {stats['win_rate']}%"
-    )
-
-    if should_alert_cooldown:
+    if trade_snapshot:
+        emoji = "✅" if trade_snapshot["status"] == "WIN" else "❌"
         send_telegram(
-            f"⏸️ {MAX_CONSECUTIVE_LOSSES} ardıcıl itkidən sonra bot "
-            f"{COOLDOWN_HOURS_AFTER_LOSSES} saat dayandırılır."
+            f"{emoji} TRADE BAĞLANDI — {trade_snapshot['status']}\n\n"
+            f"{display_symbol(trade_snapshot['symbol'])} {trade_snapshot['side']} [{trade_snapshot['tf']}]\n"
+            f"Entry: {trade_snapshot['entry']:.4f} | Exit: {trade_snapshot['exit_price']:.4f}"
         )
 
 
@@ -877,38 +668,22 @@ RESULT: {trade_snapshot["status"]}
 # POLLING WORKERS
 # ============================================================
 
-def process_pending_signals(pending_signals):
-    """Scalping botunda score-qruplaşdırma yoxdur - hər (symbol, tf)
-    siqnalı bir-birindən müstəqil açılır."""
-    for (symbol, tf), signal in pending_signals.items():
-        open_trade(signal)
-
-
 def candle_worker():
     last_seen_time = {s: {tf: None for tf in TIMEFRAMES} for s in SYMBOLS}
-
     while True:
-        pending_signals = {}
-
         for symbol in SYMBOLS:
             for tf in TIMEFRAMES:
                 tf_candles = fetch_klines(symbol, tf)
-
                 if tf_candles:
                     with lock:
                         candles[symbol][tf] = tf_candles[-MAX_CANDLES:]
-
                     closed_time = tf_candles[-2]["time"] if len(tf_candles) >= 2 else None
                     if closed_time and closed_time != last_seen_time[symbol][tf]:
                         last_seen_time[symbol][tf] = closed_time
-                        signal = check_for_signal(symbol, tf)
-                        if signal:
-                            pending_signals[(symbol, tf)] = signal
-
-                time.sleep(0.25)  # OKX rate-limit üçün kiçik fasilə
-
-        process_pending_signals(pending_signals)
-
+                        sig = check_for_signal(symbol, tf)
+                        if sig:
+                            open_trade(sig)
+                time.sleep(0.05)
         time.sleep(CANDLE_POLL_SECONDS)
 
 
@@ -917,16 +692,12 @@ def price_worker():
         with lock:
             keys_to_check = list(active_trades.keys())
 
-        symbols_needed = {k.split("|")[0] for k in keys_to_check}
-        price_cache = {}
-        for symbol in symbols_needed:
-            price_cache[symbol] = fetch_price(symbol)
-
-        for key in keys_to_check:
-            symbol = key.split("|")[0]
-            price = price_cache.get(symbol)
-            if price is not None:
-                update_trailing_stops(key, price)
+        if keys_to_check:
+            tickers = fetch_all_swap_tickers()
+            for key in keys_to_check:
+                symbol = key.split("|")[0]
+                if symbol in tickers:
+                    update_trailing_stops(key, tickers[symbol]["last"])
 
         time.sleep(PRICE_POLL_SECONDS)
 
@@ -938,13 +709,18 @@ def price_worker():
 def startup():
     global _startup_done
     with _startup_lock:
-        if _startup_done:
-            return
-        if not check_single_instance():
+        if _startup_done or not check_single_instance():
             return
         _startup_done = True
 
-    print("🚀 SCALPING BOTU (OKX, Multi-TF) BAŞLAYIR...")
+    print("🚀 SCALPING BOTU İŞƏ DÜŞDÜ (OKX)...")
+
+    # BAZADAN AKTİV TRADELƏRİN BƏRPASI (RESTART DEFENCE)
+    restored_trades = db_load_active_trades()
+    if restored_trades:
+        with lock:
+            active_trades.update(restored_trades)
+        print(f"📦 SQLite Bazadan {len(restored_trades)} aktiv trade bərpa olundu!")
 
     threading.Thread(target=candle_worker, daemon=True).start()
     threading.Thread(target=price_worker, daemon=True).start()
@@ -953,68 +729,26 @@ def startup():
         threading.Thread(target=telegram_polling_worker, daemon=True).start()
 
     if SEND_STARTUP_MESSAGE:
-        limit_str = "Limitsiz (Test)" if MAX_TRADES_PER_DAY >= 9999 else str(MAX_TRADES_PER_DAY)
         send_telegram(
-            "⚡ SCALPING BOTU AKTİVDİR! (OKX)\n\n"
-            f"📡 {', '.join(display_symbol(s) for s in SYMBOLS)} izlənilir.\n"
-            f"⏱️ Timeframe-lər (hər biri MÜSTƏQİL): {', '.join(TIMEFRAMES)}\n"
-            f"📊 EMA{EMA_FAST_PERIOD}/EMA{EMA_SLOW_PERIOD} Krosover + RSI + Həcm Filtri\n"
-            f"⚖️ Günlük Max Trade: {limit_str}\n"
-            "💾 Nəticələr SQLite-də saxlanılır.\n\n"
-            "💬 Bot əmrləri üçün Telegram-da /help yazın."
+            f"⚡ SCALPING BOTU AKTİVDİR!\n\n"
+            f"📡 Cütlər: {', '.join(display_symbol(s) for s in SYMBOLS)}\n"
+            f"⏱️ TF: {', '.join(TIMEFRAMES)}\n"
+            f"📦 Bərpa olunan trade: {len(restored_trades)}"
         )
 
 
 # ============================================================
-# ROUTES & WEBHOOK
+# ROUTES & MAIN
 # ============================================================
 
 @app.route("/")
 def home():
-    stats = get_statistics()
     with lock:
-        active_count = len(active_trades)
-        cooldown_snapshot = cooldown_until
-    return jsonify({
-        "status": "online",
-        "exchange": "OKX",
-        "strategy": "EMA crossover + RSI + Volume (scalping)",
-        "mode": "SIGNAL-ONLY (real sifariş yoxdur)",
-        "symbols": SYMBOLS,
-        "timeframes": TIMEFRAMES,
-        "active_trades": active_count,
-        "statistics": stats,
-        "cooldown_until": cooldown_snapshot.isoformat() if cooldown_snapshot else None,
-    })
-
+        ac = len(active_trades)
+    return jsonify({"status": "online", "active_trades": ac, "stats": get_statistics()})
 
 @app.route("/health")
-def health():
-    return "OK", 200
-
-
-@app.route("/stats")
-def stats_route():
-    return jsonify(get_statistics())
-
-
-@app.route("/active")
-def active_route():
-    with lock:
-        return jsonify(list(active_trades.values()))
-
-
-@app.route("/telegram-webhook", methods=["POST"])
-def telegram_webhook():
-    data = request.get_json()
-    if data:
-        process_telegram_update(data)
-    return jsonify({"status": "ok"}), 200
-
-
-# ============================================================
-# MAIN
-# ============================================================
+def health(): return "OK", 200
 
 startup()
 
